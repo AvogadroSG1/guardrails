@@ -1,0 +1,12 @@
+# Compiled binary
+guardrails-bin
+guardrails
+
+# User-specific config
+settings.json
+
+# State files
+state/
+
+# OS artifacts
+.DS_Store

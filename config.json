@@ -1,0 +1,42 @@
+{
+  "protectedBranches": ["main", "master", "develop", "release/.*", "production"],
+  "repoExclusions": ["/Users/poconnor/ObsidianNotes"],
+  "testNudge": {
+    "warnAfter": 5,
+    "strongNudgeAfter": 10,
+    "sourceExtensions": [".py", ".cs", ".ts", ".js", ".go", ".jsx", ".tsx"],
+    "testCommands": ["pytest", "dotnet test", "npm test", "npm run test", "go test", "vitest"]
+  },
+  "linters": {
+    ".py":  { "cmd": "ruff", "args": ["check", "--fix"], "formatter": "ruff format" },
+    ".cs":  { "cmd": "dotnet", "args": ["format", "--verify-no-changes"] },
+    ".ts":  { "cmd": "eslint", "args": [] },
+    ".js":  { "cmd": "eslint", "args": [] },
+    ".md":  { "cmd": "markdownlint", "args": [] },
+    ".go":  { "cmd": "golangci-lint", "args": ["run"] }
+  },
+  "secretScan": {
+    "patterns": [
+      "(?i)(api[_-]?key|secret|token|password|credential)\\s*[=:]\\s*['\"]?[A-Za-z0-9+/=_-]{8,}",
+      "(?i)AKIA[0-9A-Z]{16}",
+      "(?i)(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{36,}",
+      "-----BEGIN (RSA |EC |DSA )?PRIVATE KEY-----",
+      "(?i)bearer\\s+[A-Za-z0-9._~+/=-]{20,}"
+    ],
+    "allowPatterns": [
+      "\\$\\{.*\\}",
+      "os\\.getenv\\(",
+      "os\\.environ\\[",
+      "process\\.env\\.",
+      "Environment\\.GetEnvironmentVariable",
+      "\\{\\{\\s*\\.\\w+\\s*\\}\\}"
+    ],
+    "blockFilePatterns": ["\\.env$", "\\.env\\.local$", "\\.env\\.production$"]
+  },
+  "lintExclusions": [
+    "*/ObsidianNotes/*",
+    "*/docs/*",
+    "*/plans/*",
+    "*/.claude/*"
+  ]
+}
