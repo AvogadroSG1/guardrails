@@ -1,12 +1,12 @@
-# Compiled binary
-guardrails-bin
-guardrails
+# Compiled binary (root-level only)
+/guardrails-bin
+/guardrails
 
 # User-specific config
 settings.json
 
-# State files
-state/
+# Runtime state files
+/state/
 
 # OS artifacts
 .DS_Store
