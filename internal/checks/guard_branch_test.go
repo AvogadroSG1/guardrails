@@ -58,6 +58,12 @@ func TestGuardBranch_CustomExclusions(t *testing.T) {
 	if result.Block {
 		t.Errorf("expected allow for custom-excluded repo, got block: %q", result.Message)
 	}
+
+	// Sibling repo sharing the excluded path as a prefix must NOT be exempt.
+	sibling := GuardBranch("main", "/Users/test/my-content-repo2", false, cfg, TargetInfo{})
+	if !sibling.Block {
+		t.Error("sibling of excluded repo on main branch: expected block, got allow")
+	}
 }
 
 func TestGuardBranch_BypassChecksRunWhenCWDOutsideRepo(t *testing.T) {
@@ -178,6 +184,50 @@ func TestGuardBranch_TempDirBypass(t *testing.T) {
 			targetRepoRoot: repoRoot,
 			want:           false,
 		},
+		// New: additional git manipulation commands added to tempAlwaysBlockPatterns.
+		{
+			name:     "git merge in /tmp script",
+			filePath: "/tmp/sync.sh",
+			content:  "git merge origin/main",
+			want:     true,
+		},
+		{
+			name:     "git rebase in /tmp script",
+			filePath: "/tmp/sync.sh",
+			content:  "git rebase main",
+			want:     true,
+		},
+		{
+			name:     "git cherry-pick in /tmp script",
+			filePath: "/tmp/backport.sh",
+			content:  "git cherry-pick abc1234",
+			want:     true,
+		},
+		{
+			name:     "git stash pop in /tmp script",
+			filePath: "/tmp/restore.sh",
+			content:  "git stash pop",
+			want:     true,
+		},
+		// New: expanded checkout/switch flag variants.
+		{
+			name:     "git switch -c main in /tmp (create flag)",
+			filePath: "/tmp/branch.sh",
+			content:  "git switch -c main",
+			want:     true,
+		},
+		{
+			name:     "git checkout -B master in /tmp (force-create flag)",
+			filePath: "/tmp/branch.sh",
+			content:  "git checkout -B master",
+			want:     true,
+		},
+		{
+			name:     "git switch --create develop in /tmp",
+			filePath: "/tmp/branch.sh",
+			content:  "git switch --create develop",
+			want:     true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -273,6 +323,22 @@ func TestGuardBranch_CrossRepoWrite(t *testing.T) {
 			targetBranch:   "main",
 			targetRepoRoot: "/Users/test/ObsidianNotes/Work",
 			want:           false,
+		},
+		// New: sibling of excluded repo shares path prefix but must NOT be exempt.
+		{
+			name:           "sibling of excluded repo is not itself excluded (must block)",
+			targetFilePath: "/Users/test/my-content-repo2/post.md",
+			targetBranch:   "main",
+			targetRepoRoot: "/Users/test/my-content-repo2",
+			want:           true,
+		},
+		// New: ObsidianNotes substring in non-component position must NOT exempt.
+		{
+			name:           "repo with ObsidianNotes as substring (not path component) must block",
+			targetFilePath: "/Users/test/myObsidianNotesPlugin/main.go",
+			targetBranch:   "main",
+			targetRepoRoot: "/Users/test/myObsidianNotesPlugin",
+			want:           true,
 		},
 	}
 
@@ -394,6 +460,27 @@ func TestGuardBranch_IndirectWrite(t *testing.T) {
 			content:  "tool --output /tmp/out.txt /Users/test/code/myproject/input.go",
 			want:     false,
 		},
+		// New: no-space redirect (no whitespace before >) must be caught.
+		{
+			name:     "no-space redirect into repoRoot",
+			filePath: "/tmp/inject.sh",
+			content:  "echo evil>/Users/test/code/myproject/file.go",
+			want:     true,
+		},
+		// New: destination-aware open() — write to /tmp while reading repoRoot must allow.
+		{
+			name:     "python write to /tmp while reading repoRoot on same line (allow)",
+			filePath: "/tmp/extract.py",
+			content:  "data=open('/Users/test/code/myproject/input.go','r').read(); open('/tmp/out.txt','w').write(data)",
+			want:     false,
+		},
+		// New: tee in file content targeting repoRoot must block.
+		{
+			name:     "tee in content targeting repoRoot",
+			filePath: "/tmp/pipe.sh",
+			content:  "cmd | tee /Users/test/code/myproject/out.go",
+			want:     true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -500,6 +587,54 @@ func TestGuardBranch_BashCommandWrite(t *testing.T) {
 		{
 			name:    "--output pointing to /tmp while repoRoot is a read arg",
 			command: "tool --output /tmp/out.txt /Users/test/code/myproject/input.go",
+			want:    false,
+		},
+		// New: direct tee (no pipe) targeting repoRoot must block.
+		{
+			name:    "direct tee targeting repoRoot",
+			command: "tee /Users/test/code/myproject/out.go",
+			want:    true,
+		},
+		// New: tee with -a flag must block.
+		{
+			name:    "tee -a targeting repoRoot",
+			command: "tee -a /Users/test/code/myproject/out.go",
+			want:    true,
+		},
+		// New: --output= (equals form) must block.
+		{
+			name:    "--output= form pointing to repoRoot",
+			command: "tool --output=/Users/test/code/myproject/main.go",
+			want:    true,
+		},
+		// New: -o= (equals form) must block.
+		{
+			name:    "-o= form pointing to repoRoot",
+			command: "tool -o=/Users/test/code/myproject/main.go",
+			want:    true,
+		},
+		// New: double-quoted redirect target must block.
+		{
+			name:    "double-quoted redirect target",
+			command: `./evil > "/Users/test/code/myproject/main.go"`,
+			want:    true,
+		},
+		// New: single-quoted redirect target must block.
+		{
+			name:    "single-quoted redirect target",
+			command: `./evil > '/Users/test/code/myproject/main.go'`,
+			want:    true,
+		},
+		// New: cp in Bash command targeting repoRoot must block.
+		{
+			name:    "cp into repoRoot from bash command",
+			command: "cp /tmp/evil /Users/test/code/myproject/file.go",
+			want:    true,
+		},
+		// New: cp with repoRoot as source (not destination) must allow in bash command too.
+		{
+			name:    "cp with repoRoot as source in bash command (allow)",
+			command: "cp /Users/test/code/myproject/src/app.go /tmp/backup.go",
 			want:    false,
 		},
 	}

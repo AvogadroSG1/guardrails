@@ -187,10 +187,16 @@ func runGuardBranch(input HookInput, cfg config.Config) CheckResult {
 	}
 	json.Unmarshal(input.ToolInput, &bash)
 
-	// Normalize filePath to avoid symlink or relative-path confusion.
+	// Normalize filePath: resolve relative/dotdot components, then resolve
+	// symlinks on the parent directory. The file itself may not exist yet (it is
+	// being created), so EvalSymlinks runs on the parent rather than the full path.
 	if filePath != "" {
 		if abs, err := filepath.Abs(filePath); err == nil {
-			filePath = filepath.Clean(abs)
+			abs = filepath.Clean(abs)
+			if parent, err := filepath.EvalSymlinks(filepath.Dir(abs)); err == nil {
+				abs = filepath.Join(parent, filepath.Base(abs))
+			}
+			filePath = abs
 		}
 	}
 
