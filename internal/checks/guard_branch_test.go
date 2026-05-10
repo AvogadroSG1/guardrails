@@ -198,6 +198,7 @@ func TestGuardBranch_TempDirBypass(t *testing.T) {
 
 func TestGuardBranch_CrossRepoWrite(t *testing.T) {
 	cfg := config.Default()
+	cfg.RepoExclusions = append(cfg.RepoExclusions, "/Users/test/my-content-repo")
 	cwdBranch := "feature/my-work"
 	cwdRepoRoot := "/Users/test/code/repo-a"
 
@@ -255,6 +256,22 @@ func TestGuardBranch_CrossRepoWrite(t *testing.T) {
 			targetFilePath: "/Users/test/documents/notes.txt",
 			targetBranch:   "",
 			targetRepoRoot: "",
+			want:           false,
+		},
+		// Fix: cross-repo check must honor RepoExclusions for the target repo.
+		{
+			name:           "write to excluded target repo on main (should allow)",
+			targetFilePath: "/Users/test/my-content-repo/post.md",
+			targetBranch:   "main",
+			targetRepoRoot: "/Users/test/my-content-repo",
+			want:           false, // excluded via cfg.RepoExclusions set below
+		},
+		// Fix: cross-repo check must honor ObsidianNotes exclusion for target.
+		{
+			name:           "write to ObsidianNotes target repo on main (should allow)",
+			targetFilePath: "/Users/test/ObsidianNotes/Work/note.md",
+			targetBranch:   "main",
+			targetRepoRoot: "/Users/test/ObsidianNotes/Work",
 			want:           false,
 		},
 	}
@@ -342,6 +359,27 @@ func TestGuardBranch_IndirectWrite(t *testing.T) {
 			content:  "data = open('/Users/test/code/myproject/main.go').read()",
 			want:     false,
 		},
+		// Fix: open() in r+ (read-write) mode must block.
+		{
+			name:     "python open r+ mode (read-write) must block",
+			filePath: "/tmp/rw.py",
+			content:  "f = open('/Users/test/code/myproject/main.go', 'r+')",
+			want:     true,
+		},
+		// Fix: >= in code containing repoRoot must not be treated as redirect.
+		{
+			name:     "comparison >= containing repoRoot path in string (no redirect)",
+			filePath: "/tmp/check.py",
+			content:  "if version >= '/Users/test/code/myproject/v2':",
+			want:     false,
+		},
+		// Fix: sibling directory with repoRoot as substring must not match.
+		{
+			name:     "write to sibling directory whose path contains repoRoot",
+			filePath: "/tmp/sibling.sh",
+			content:  "echo data > /Users/test/code/myproject2/file.go",
+			want:     false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -425,6 +463,18 @@ func TestGuardBranch_BashCommandWrite(t *testing.T) {
 			name:    "path starting with /tmp but not a temp subpath",
 			command: "./evil > /tmpfile",
 			want:    false, // /tmpfile is not in /tmp/ — no repoRoot involved, so also no block
+		},
+		// Fix: sibling directory whose path contains repoRoot as substring must not block.
+		{
+			name:    "redirect into sibling directory (not actually repoRoot)",
+			command: "./evil > /Users/test/code/myproject2/file.go",
+			want:    false,
+		},
+		// Fix: => (fat arrow) containing repoRoot must not be treated as redirect.
+		{
+			name:    "fat arrow => in command containing repoRoot path",
+			command: "map.put(key => /Users/test/code/myproject/file)",
+			want:    false,
 		},
 	}
 
