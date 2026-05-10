@@ -60,6 +60,54 @@ func TestGuardBranch_CustomExclusions(t *testing.T) {
 	}
 }
 
+func TestGuardBranch_BypassChecksRunWhenCWDOutsideRepo(t *testing.T) {
+	cfg := config.Default()
+	// branch == "" simulates CWD outside any git repo (gitCurrentBranch returns "").
+	// Target-based bypass checks must still fire in this state.
+	tests := []struct {
+		name   string
+		target TargetInfo
+		want   bool
+	}{
+		{
+			name: "cross-repo write to protected branch from outside any repo",
+			target: TargetInfo{
+				FilePath: "/Users/test/code/repo-b/src/app.py",
+				Branch:   "main",
+				RepoRoot: "/Users/test/code/repo-b",
+			},
+			want: true,
+		},
+		{
+			name: "temp script with git commit from outside any repo",
+			target: TargetInfo{
+				FilePath: "/tmp/evil.sh",
+				Content:  "git commit -m 'bypass'",
+			},
+			want: true,
+		},
+		{
+			name: "benign write from outside any repo",
+			target: TargetInfo{
+				FilePath: "/tmp/helper.py",
+				Content:  "print('hello')",
+			},
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// branch="" and repoRoot="" simulate CWD not in any git repo.
+			result := GuardBranch("", "", false, cfg, tt.target)
+			if result.Block != tt.want {
+				t.Errorf("GuardBranch outside-repo for %q: Block=%v, want %v; message=%q",
+					tt.target.FilePath, result.Block, tt.want, result.Message)
+			}
+		})
+	}
+}
+
 func TestGuardBranch_TempDirBypass(t *testing.T) {
 	cfg := config.Default()
 	// CWD repo is on a safe feature branch — normal protected-branch check passes.
@@ -274,6 +322,26 @@ func TestGuardBranch_IndirectWrite(t *testing.T) {
 			content:  "echo 'data' > /some/other/path/file.txt",
 			want:     false,
 		},
+		// Regression: cat suppression must not override redirect into repoRoot.
+		{
+			name:     "cat reading from repoRoot then redirecting elsewhere (safe)",
+			filePath: "/tmp/read.sh",
+			content:  "cat /Users/test/code/myproject/main.go > /tmp/out.txt",
+			want:     false,
+		},
+		{
+			name:     "cat reading from elsewhere then redirecting into repoRoot (write)",
+			filePath: "/tmp/write.sh",
+			content:  "cat /some/source.txt > /Users/test/code/myproject/main.go",
+			want:     true,
+		},
+		// Regression: open() without explicit mode should not block (defaults to read).
+		{
+			name:     "python open without mode (defaults to read)",
+			filePath: "/tmp/read.py",
+			content:  "data = open('/Users/test/code/myproject/main.go').read()",
+			want:     false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -345,6 +413,18 @@ func TestGuardBranch_BashCommandWrite(t *testing.T) {
 			name:    "command with no mention of repoRoot",
 			command: "go build ./...",
 			want:    false,
+		},
+		// Regression: first repoRoot occurrence is a read arg; second is the redirect target.
+		{
+			name:    "cat reading from repoRoot then redirecting into repoRoot",
+			command: "cat /Users/test/code/myproject/in.go > /Users/test/code/myproject/out.go",
+			want:    true,
+		},
+		// /tmpfile must not match /tmp/ prefix check.
+		{
+			name:    "path starting with /tmp but not a temp subpath",
+			command: "./evil > /tmpfile",
+			want:    false, // /tmpfile is not in /tmp/ — no repoRoot involved, so also no block
 		},
 	}
 

@@ -31,22 +31,24 @@ var tempAlwaysBlockPatterns = []*regexp.Regexp{
 
 var tempCheckoutPattern = regexp.MustCompile(`(?i)git\s+(checkout|switch)\s+`)
 
-// contentWritePatterns detects write operations in file content targeting an
-// absolute path. Used to catch scripts (at any location) that output into the
-// guarded project directory.
+// contentWritePatterns detects non-redirect write operations in file content.
+// Shell redirects are handled separately in checkContentForPathWrites to
+// correctly prioritise them over read-only suppression.
 var contentWritePatterns = []*regexp.Regexp{
-	regexp.MustCompile(`open\s*\(`),                       // Python open()
-	regexp.MustCompile(`fs\.(writeFile|appendFile)\s*\(`), // Node.js
-	regexp.MustCompile(`>\s*\S`),                          // shell redirect
-	regexp.MustCompile(`\b(cp|mv|rsync)\s+`),              // copy/move
+	regexp.MustCompile(`open\s*\(.*,\s*['"][wa+]`),         // Python open in write/append/create mode
+	regexp.MustCompile(`fs\.(writeFile|appendFile)\s*\(`),   // Node.js
+	regexp.MustCompile(`\b(cp|mv|rsync)\s+`),                // copy/move
 }
 
 // contentReadOnlyPatterns matches operations that only read; used to suppress
-// false positives from contentWritePatterns.
+// false positives when no shell redirect is present.
 var contentReadOnlyPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`\bcat\s+`),
 	regexp.MustCompile(`open\s*\(.*,\s*['"]r['"]\s*\)`), // Python open(..., 'r')
 }
+
+// shellRedirectRE matches shell redirect operators (> or >>) in content lines.
+var shellRedirectRE = regexp.MustCompile(`>{1,2}`)
 
 // bashWriteFlagPatterns detects non-redirect write operators in Bash commands
 // that precede the target path (tee, common CLI write flags).
@@ -61,8 +63,15 @@ func isTempPath(path string) bool {
 			return true
 		}
 	}
-	if t := os.TempDir(); t != "" && strings.HasPrefix(path, t) {
-		return true
+	// os.TempDir() may return a path without a trailing separator (e.g. "/tmp"),
+	// which would cause "/tmpfile" to falsely match. Always append the separator.
+	if t := os.TempDir(); t != "" {
+		if !strings.HasSuffix(t, string(os.PathSeparator)) {
+			t += string(os.PathSeparator)
+		}
+		if strings.HasPrefix(path, t) {
+			return true
+		}
 	}
 	return false
 }
@@ -102,7 +111,8 @@ func checkTempOrNonGitContent(content string, cfg config.Config) CheckResult {
 }
 
 // checkContentForPathWrites scans file content for write operations targeting
-// repoRoot, to detect scripts written anywhere that output into the guarded project.
+// repoRoot. Shell redirects are checked first and override read-only suppression,
+// so that lines like "cat /repo/in > /repo/out" are correctly caught.
 func checkContentForPathWrites(content, repoRoot string) CheckResult {
 	if repoRoot == "" {
 		return CheckResult{}
@@ -111,7 +121,20 @@ func checkContentForPathWrites(content, repoRoot string) CheckResult {
 		if !strings.Contains(line, repoRoot) {
 			continue
 		}
-		// Skip lines that are clearly read-only.
+
+		// Shell redirect takes priority: check whether repoRoot appears after
+		// any > or >> operator in this line. This must run before read-only
+		// suppression so "cat /repo/in > /repo/out" is correctly blocked.
+		for _, loc := range shellRedirectRE.FindAllStringIndex(line, -1) {
+			if strings.Contains(line[loc[1]:], repoRoot) {
+				return CheckResult{
+					Block:   true,
+					Message: fmt.Sprintf("File content writes to protected repo %q: %q", repoRoot, truncate(line, 120)),
+				}
+			}
+		}
+
+		// Skip lines that are purely read-only (no redirect matched above).
 		readOnly := false
 		for _, re := range contentReadOnlyPatterns {
 			if re.MatchString(line) {
@@ -122,6 +145,8 @@ func checkContentForPathWrites(content, repoRoot string) CheckResult {
 		if readOnly {
 			continue
 		}
+
+		// Other write patterns: Python open in write mode, Node.js, cp/mv.
 		for _, re := range contentWritePatterns {
 			if re.MatchString(line) {
 				return CheckResult{
@@ -135,32 +160,44 @@ func checkContentForPathWrites(content, repoRoot string) CheckResult {
 }
 
 // checkBashCommandForWrites detects shell redirects or write-flag patterns in a
-// Bash command that target the protected repo path. It inspects the portion of
-// the command before the first appearance of repoRoot to find write operators.
+// Bash command that target the protected repo path. It scans ALL occurrences of
+// repoRoot in the command (not just the first) so that commands like
+// "cat /repo/in > /repo/out" where the first occurrence is a read target are
+// still correctly caught by the second occurrence's write context.
 func checkBashCommandForWrites(command, repoRoot string) CheckResult {
 	if repoRoot == "" || !strings.Contains(command, repoRoot) {
 		return CheckResult{}
 	}
-	repoIdx := strings.Index(command, repoRoot)
-	before := command[:repoIdx]
 
-	// Shell redirect: the portion before repoRoot ends with > or >> (after trimming whitespace).
-	trimmed := strings.TrimRight(before, " \t")
-	if strings.HasSuffix(trimmed, ">") || strings.HasSuffix(trimmed, ">>") {
-		return CheckResult{
-			Block:   true,
-			Message: fmt.Sprintf("Bash command writes to protected repo %q: blocked to prevent indirect branch bypass.", repoRoot),
+	offset := 0
+	for {
+		idx := strings.Index(command[offset:], repoRoot)
+		if idx == -1 {
+			break
 		}
-	}
+		absIdx := offset + idx
+		before := command[:absIdx]
 
-	// Other write operators: tee, common write flags.
-	for _, re := range bashWriteFlagPatterns {
-		if re.MatchString(before) {
+		// Shell redirect: the portion before this occurrence ends with > or >>.
+		trimmed := strings.TrimRight(before, " \t")
+		if strings.HasSuffix(trimmed, ">") || strings.HasSuffix(trimmed, ">>") {
 			return CheckResult{
 				Block:   true,
 				Message: fmt.Sprintf("Bash command writes to protected repo %q: blocked to prevent indirect branch bypass.", repoRoot),
 			}
 		}
+
+		// Other write operators: tee, common write flags.
+		for _, re := range bashWriteFlagPatterns {
+			if re.MatchString(before) {
+				return CheckResult{
+					Block:   true,
+					Message: fmt.Sprintf("Bash command writes to protected repo %q: blocked to prevent indirect branch bypass.", repoRoot),
+				}
+			}
+		}
+
+		offset = absIdx + len(repoRoot)
 	}
 	return CheckResult{}
 }
@@ -168,44 +205,9 @@ func checkBashCommandForWrites(command, repoRoot string) CheckResult {
 // GuardBranch checks if writes should be allowed based on branch, repo state,
 // and target file/command context.
 func GuardBranch(branch string, repoRoot string, hasStagedChanges bool, cfg config.Config, target TargetInfo) CheckResult {
-	// 1. Empty branch means detached HEAD — allow.
-	if branch == "" {
-		return CheckResult{}
-	}
-
-	// 2. Check repo exclusions from config.
-	for _, excl := range cfg.RepoExclusions {
-		if strings.HasPrefix(repoRoot, excl) {
-			return CheckResult{}
-		}
-	}
-
-	// 3. Default exclusion: ObsidianNotes repos are always allowed.
-	if strings.Contains(repoRoot, "ObsidianNotes") {
-		return CheckResult{}
-	}
-
-	// 4. Check protected branches.
-	for _, pattern := range cfg.ProtectedBranches {
-		re, err := regexp.Compile("^" + pattern + "$")
-		if err != nil {
-			continue
-		}
-		if re.MatchString(branch) {
-			return CheckResult{
-				Block:   true,
-				Message: fmt.Sprintf("Branch %q is protected. Protected branches: %s", branch, strings.Join(cfg.ProtectedBranches, ", ")),
-			}
-		}
-	}
-
-	// 5. Check for staged changes.
-	if hasStagedChanges {
-		return CheckResult{
-			Block:   true,
-			Message: "Repository has staged changes. Please commit or stash manual changes first.",
-		}
-	}
+	// Target-based bypass checks run unconditionally — even when CWD has no git
+	// repo (branch == "") — because a script or Bash command can still write into
+	// a protected repo from outside any git working tree.
 
 	// 6a. Temp-dir / non-git content scan: detect git manipulation in scripts
 	//     written to locations that bypass the normal branch check.
@@ -245,6 +247,46 @@ func GuardBranch(branch string, repoRoot string, hasStagedChanges bool, cfg conf
 						target.FilePath, target.RepoRoot, target.Branch, strings.Join(cfg.ProtectedBranches, ", ")),
 				}
 			}
+		}
+	}
+
+	// 1. Empty branch means detached HEAD or CWD is outside any git repo — allow
+	//    CWD-based writes (target-based checks above have already run).
+	if branch == "" {
+		return CheckResult{}
+	}
+
+	// 2. Check repo exclusions from config.
+	for _, excl := range cfg.RepoExclusions {
+		if strings.HasPrefix(repoRoot, excl) {
+			return CheckResult{}
+		}
+	}
+
+	// 3. Default exclusion: ObsidianNotes repos are always allowed.
+	if strings.Contains(repoRoot, "ObsidianNotes") {
+		return CheckResult{}
+	}
+
+	// 4. Check protected branches.
+	for _, pattern := range cfg.ProtectedBranches {
+		re, err := regexp.Compile("^" + pattern + "$")
+		if err != nil {
+			continue
+		}
+		if re.MatchString(branch) {
+			return CheckResult{
+				Block:   true,
+				Message: fmt.Sprintf("Branch %q is protected. Protected branches: %s", branch, strings.Join(cfg.ProtectedBranches, ", ")),
+			}
+		}
+	}
+
+	// 5. Check for staged changes.
+	if hasStagedChanges {
+		return CheckResult{
+			Block:   true,
+			Message: "Repository has staged changes. Please commit or stash manual changes first.",
 		}
 	}
 
