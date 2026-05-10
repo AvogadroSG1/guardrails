@@ -31,16 +31,16 @@ var tempAlwaysBlockPatterns = []*regexp.Regexp{
 
 var tempCheckoutPattern = regexp.MustCompile(`(?i)git\s+(checkout|switch)\s+`)
 
-// contentWritePatterns detects non-redirect write operations in file content.
-// Shell redirects are handled separately in checkContentForPathWrites to
-// correctly prioritise them over read-only suppression.
-// The open() pattern requires an explicit write/append/create/update mode
-// (w, a, x, or + in any position) to avoid false-positives on 'r', 'rb', etc.
+// contentWritePatterns detects non-redirect, non-cp/mv write operations in
+// file content. Shell redirects and cp/mv/rsync are handled separately with
+// destination-aware logic to avoid false positives when repoRoot is the source.
 var contentWritePatterns = []*regexp.Regexp{
 	regexp.MustCompile(`open\s*\(.*,\s*['"][^'"]*[wax+]`),  // Python open in write/append/create/update mode
 	regexp.MustCompile(`fs\.(writeFile|appendFile)\s*\(`),   // Node.js
-	regexp.MustCompile(`\b(cp|mv|rsync)\s+`),                // copy/move
 }
+
+// cpMvRsyncRE matches cp/mv/rsync commands for destination-aware write detection.
+var cpMvRsyncRE = regexp.MustCompile(`\b(cp|mv|rsync)\b`)
 
 // contentReadOnlyPatterns matches operations that only read; used to suppress
 // false positives when no shell redirect is present.
@@ -49,16 +49,16 @@ var contentReadOnlyPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`open\s*\(.*,\s*['"]r['"]\s*\)`), // Python open(..., 'r')
 }
 
-// shellRedirectRE matches shell redirect operators (> or >>) in content lines.
-// Boundary checks in the consuming code exclude >=, =>, and -> false positives.
-var shellRedirectRE = regexp.MustCompile(`>{1,2}`)
+// shellRedirectRE matches shell redirect operators (> or >>) only when preceded
+// by whitespace, a shell metachar (;|&), digit (file descriptor), or
+// start-of-line. This avoids false positives from >=, =>, and -> operators.
+// The > or >> is in capture group 1; use FindAllStringSubmatchIndex.
+var shellRedirectRE = regexp.MustCompile(`(?:^|[\s;|&\d])(>{1,2})`)
 
-// bashWriteFlagPatterns detects non-redirect write operators in Bash commands
-// that precede the target path (tee, common CLI write flags).
-var bashWriteFlagPatterns = []*regexp.Regexp{
-	regexp.MustCompile(`\|\s*tee\b`),
-	regexp.MustCompile(`(?i)(--output|-o\b|--file|--target|--write(?:-to)?)`),
-}
+// writeOpAtEndRE matches write operators that must appear immediately before the
+// target path in a Bash command (i.e. anchored to the end of the before-portion).
+// Covers tee, common CLI write flags, and the short -o flag.
+var writeOpAtEndRE = regexp.MustCompile(`(?:\|\s*tee|--output|--file|--target|--write(?:-to)?|\s-o)$`)
 
 func isTempPath(path string) bool {
 	for _, dir := range knownTempDirs {
@@ -90,10 +90,36 @@ func repoIsExcluded(root string, cfg config.Config) bool {
 	return strings.Contains(root, "ObsidianNotes")
 }
 
+// cpMvTargetsRepo reports whether a cp/mv/rsync command line writes INTO the
+// protected repo. The destination is identified as the last path-like token
+// (starting with /) in the line; the check only fires when that token is under
+// repoPrefix, preventing false positives when repoRoot is the source argument.
+func cpMvTargetsRepo(line, repoPrefix string) bool {
+	tokens := strings.Fields(line)
+	for i := len(tokens) - 1; i >= 0; i-- {
+		t := strings.Trim(tokens[i], `"'`)
+		if strings.HasPrefix(t, "/") {
+			return strings.HasPrefix(t, repoPrefix)
+		}
+	}
+	return false
+}
+
 // checkTempOrNonGitContent scans file content for git manipulation commands.
 // Tier-1: always block commit/push/reset. Tier-2: block checkout/switch only
 // when targeting a protected branch from cfg.
+// Protected-branch checkout regexes are compiled once before the line scan.
 func checkTempOrNonGitContent(content string, cfg config.Config) CheckResult {
+	// Pre-compile protected-branch checkout/switch patterns once for all lines.
+	var checkoutREs []*regexp.Regexp
+	for _, pattern := range cfg.ProtectedBranches {
+		re, err := regexp.Compile(`(?i)git\s+(checkout|switch)\s+(-b\s+)?` + pattern + `\b`)
+		if err != nil {
+			continue
+		}
+		checkoutREs = append(checkoutREs, re)
+	}
+
 	for _, line := range strings.Split(content, "\n") {
 		line = strings.TrimSpace(line)
 
@@ -107,15 +133,11 @@ func checkTempOrNonGitContent(content string, cfg config.Config) CheckResult {
 		}
 
 		if tempCheckoutPattern.MatchString(line) {
-			for _, pattern := range cfg.ProtectedBranches {
-				re, err := regexp.Compile(`(?i)git\s+(checkout|switch)\s+(-b\s+)?` + pattern + `\b`)
-				if err != nil {
-					continue
-				}
+			for _, re := range checkoutREs {
 				if re.MatchString(line) {
 					return CheckResult{
 						Block:   true,
-						Message: fmt.Sprintf("Script in temp/non-git path targets protected branch %q: %q", pattern, truncate(line, 120)),
+						Message: fmt.Sprintf("Script in temp/non-git path targets protected branch: %q", truncate(line, 120)),
 					}
 				}
 			}
@@ -129,12 +151,13 @@ func checkTempOrNonGitContent(content string, cfg config.Config) CheckResult {
 // path contains repoRoot as a substring are not falsely matched.
 // Shell redirects are checked first and override read-only suppression so that
 // lines like "cat /repo/in > /repo/out" are correctly caught.
+// cp/mv/rsync only trigger when repoRoot is the destination, not the source.
 func checkContentForPathWrites(content, repoRoot string) CheckResult {
 	if repoRoot == "" {
 		return CheckResult{}
 	}
 	sep := string(os.PathSeparator)
-	repoPrefix := repoRoot + sep // require path boundary to avoid matching siblings
+	repoPrefix := repoRoot + sep
 
 	for _, line := range strings.Split(content, "\n") {
 		if !strings.Contains(line, repoPrefix) {
@@ -142,17 +165,14 @@ func checkContentForPathWrites(content, repoRoot string) CheckResult {
 		}
 
 		// Shell redirect takes priority: check whether repoPrefix appears after
-		// any > or >> operator in this line. This must run before read-only
-		// suppression so "cat /repo/in > /repo/out" is correctly blocked.
-		// Boundary checks skip >=, =>, -> which are not shell redirects.
-		for _, loc := range shellRedirectRE.FindAllStringIndex(line, -1) {
-			afterPos := loc[1]
-			// >= is a comparison operator, not a redirect.
+		// any > or >> operator in this line. shellRedirectRE requires the > to be
+		// preceded by whitespace/metachar/digit, which excludes =>, -> operators.
+		// We additionally skip >= (> followed by =) in the loop below.
+		for _, loc := range shellRedirectRE.FindAllStringSubmatchIndex(line, -1) {
+			// loc[2]:loc[3] is capture group 1 (the > or >>).
+			afterPos := loc[3]
+			// Skip >= (comparison operator): > followed immediately by =.
 			if afterPos < len(line) && line[afterPos] == '=' {
-				continue
-			}
-			// => (fat arrow) and -> (pointer) are not redirects.
-			if loc[0] > 0 && (line[loc[0]-1] == '=' || line[loc[0]-1] == '-') {
 				continue
 			}
 			if strings.Contains(line[afterPos:], repoPrefix) {
@@ -163,7 +183,17 @@ func checkContentForPathWrites(content, repoRoot string) CheckResult {
 			}
 		}
 
-		// Skip lines that are purely read-only (no redirect matched above).
+		// cp/mv/rsync: only block when repoPrefix is the destination (last path token).
+		if cpMvRsyncRE.MatchString(line) {
+			if cpMvTargetsRepo(line, repoPrefix) {
+				return CheckResult{
+					Block:   true,
+					Message: fmt.Sprintf("File content writes to protected repo %q: %q", repoRoot, truncate(line, 120)),
+				}
+			}
+		}
+
+		// Skip lines that are purely read-only (no redirect or cp/mv matched above).
 		readOnly := false
 		for _, re := range contentReadOnlyPatterns {
 			if re.MatchString(line) {
@@ -175,7 +205,7 @@ func checkContentForPathWrites(content, repoRoot string) CheckResult {
 			continue
 		}
 
-		// Other write patterns: Python open in write mode, Node.js, cp/mv.
+		// Remaining write patterns: Python open in write mode, Node.js.
 		for _, re := range contentWritePatterns {
 			if re.MatchString(line) {
 				return CheckResult{
@@ -192,6 +222,11 @@ func checkContentForPathWrites(content, repoRoot string) CheckResult {
 // Bash command that target the protected repo path. Uses repoRoot+"/" (repoPrefix)
 // to avoid false-positives from sibling directories. Scans ALL occurrences so
 // "cat /repo/in > /repo/out" is caught at the second occurrence.
+//
+// Write flags (--output, -o, etc.) are only flagged when they appear immediately
+// before the repoRoot occurrence (i.e. the flag is the last token in the
+// before-portion), preventing false positives like:
+// "tool --output /tmp/out /repo/input" where the flag targets /tmp/out.
 func checkBashCommandForWrites(command, repoRoot string) CheckResult {
 	if repoRoot == "" {
 		return CheckResult{}
@@ -210,23 +245,18 @@ func checkBashCommandForWrites(command, repoRoot string) CheckResult {
 		}
 		absIdx := offset + idx
 		before := command[:absIdx]
+		trimmed := strings.TrimRight(before, " \t")
 
 		// Shell redirect: the portion before this occurrence ends with > or >>.
-		// HasSuffix naturally excludes >= (which ends with =, not >) and =>
-		// (which also ends with > preceded by = — but trimmed ends with > so we
-		// must also check the character before the >).
-		trimmed := strings.TrimRight(before, " \t")
+		// Exclude => and ->: check the character immediately before the arrow.
 		if strings.HasSuffix(trimmed, ">") || strings.HasSuffix(trimmed, ">>") {
-			// Exclude => and ->: check the character immediately before the > (or >>).
-			isDoubleAngle := strings.HasSuffix(trimmed, ">>")
+			isDoubleArrow := strings.HasSuffix(trimmed, ">>")
 			charBeforeArrow := len(trimmed) - 1 // index of trailing >
-			if isDoubleAngle {
+			if isDoubleArrow {
 				charBeforeArrow = len(trimmed) - 2 // index of first > in >>
 			}
-			charBefore := charBeforeArrow - 1 // character preceding the arrow
-			if charBefore >= 0 && (trimmed[charBefore] == '=' || trimmed[charBefore] == '-') {
-				// => or -> (or =>> / ->>) — not a shell redirect.
-			} else {
+			charBefore := charBeforeArrow - 1
+			if charBefore < 0 || (trimmed[charBefore] != '=' && trimmed[charBefore] != '-') {
 				return CheckResult{
 					Block:   true,
 					Message: fmt.Sprintf("Bash command writes to protected repo %q: blocked to prevent indirect branch bypass.", repoRoot),
@@ -234,13 +264,12 @@ func checkBashCommandForWrites(command, repoRoot string) CheckResult {
 			}
 		}
 
-		// Other write operators: tee, common write flags.
-		for _, re := range bashWriteFlagPatterns {
-			if re.MatchString(before) {
-				return CheckResult{
-					Block:   true,
-					Message: fmt.Sprintf("Bash command writes to protected repo %q: blocked to prevent indirect branch bypass.", repoRoot),
-				}
+		// Write operators (tee, --output, etc.) must appear immediately before
+		// repoRoot — i.e. the write op is the last meaningful token in before.
+		if writeOpAtEndRE.MatchString(trimmed) {
+			return CheckResult{
+				Block:   true,
+				Message: fmt.Sprintf("Bash command writes to protected repo %q: blocked to prevent indirect branch bypass.", repoRoot),
 			}
 		}
 

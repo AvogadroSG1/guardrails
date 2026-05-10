@@ -187,6 +187,13 @@ func runGuardBranch(input HookInput, cfg config.Config) CheckResult {
 	}
 	json.Unmarshal(input.ToolInput, &bash)
 
+	// Normalize filePath to avoid symlink or relative-path confusion.
+	if filePath != "" {
+		if abs, err := filepath.Abs(filePath); err == nil {
+			filePath = filepath.Clean(abs)
+		}
+	}
+
 	// Resolve git context for the target path.
 	var targetBranch, targetRepoRoot string
 	if filePath != "" {

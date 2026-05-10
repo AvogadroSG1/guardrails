@@ -380,6 +380,20 @@ func TestGuardBranch_IndirectWrite(t *testing.T) {
 			content:  "echo data > /Users/test/code/myproject2/file.go",
 			want:     false,
 		},
+		// Fix: cp with repoRoot as source (not destination) must not block.
+		{
+			name:     "cp with repoRoot as source, /tmp as destination",
+			filePath: "/tmp/backup.sh",
+			content:  "cp /Users/test/code/myproject/main.go /tmp/backup.go",
+			want:     false,
+		},
+		// Fix: write flag pointing to non-repo path must not block when repoRoot is only a read arg.
+		{
+			name:     "--output pointing to /tmp while repoRoot is a read arg",
+			filePath: "/tmp/convert.sh",
+			content:  "tool --output /tmp/out.txt /Users/test/code/myproject/input.go",
+			want:     false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -474,6 +488,18 @@ func TestGuardBranch_BashCommandWrite(t *testing.T) {
 		{
 			name:    "fat arrow => in command containing repoRoot path",
 			command: "map.put(key => /Users/test/code/myproject/file)",
+			want:    false,
+		},
+		// Fix: cp/mv with repoRoot as source (not destination) must not block.
+		{
+			name:    "cp with repoRoot as source must allow",
+			command: "cp /Users/test/code/myproject/src/app.go /tmp/backup.go",
+			want:    false,
+		},
+		// Fix: write flag pointing to non-repo path must not block even when repoRoot appears elsewhere.
+		{
+			name:    "--output pointing to /tmp while repoRoot is a read arg",
+			command: "tool --output /tmp/out.txt /Users/test/code/myproject/input.go",
 			want:    false,
 		},
 	}
