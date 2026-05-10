@@ -109,7 +109,7 @@ func runCheck(name string, event string, input HookInput, cfg config.Config) Che
 	case "safety-guard":
 		return runSafetyGuard(input)
 	case "guard-branch":
-		return runGuardBranch(cfg)
+		return runGuardBranch(input, cfg)
 	case "lint":
 		return runLint(input, cfg)
 	case "test-nudge":
@@ -159,11 +159,48 @@ func runSafetyGuard(input HookInput) CheckResult {
 	return checks.SafetyGuard(bash.Command)
 }
 
-func runGuardBranch(cfg config.Config) CheckResult {
+func runGuardBranch(input HookInput, cfg config.Config) CheckResult {
 	branch := gitCurrentBranch()
 	repoRoot := gitRepoRoot()
 	hasStagedChanges := gitHasStagedChanges()
-	return checks.GuardBranch(branch, repoRoot, hasStagedChanges, cfg)
+
+	// Extract Write/Edit tool fields.
+	var file struct {
+		FilePath string `json:"file_path"`
+		Content  string `json:"content"`
+		Path     string `json:"path"`
+		NewText  string `json:"new_text"`
+	}
+	json.Unmarshal(input.ToolInput, &file)
+	filePath := file.FilePath
+	if filePath == "" {
+		filePath = file.Path
+	}
+	content := file.Content
+	if content == "" {
+		content = file.NewText
+	}
+
+	// Extract Bash tool field.
+	var bash struct {
+		Command string `json:"command"`
+	}
+	json.Unmarshal(input.ToolInput, &bash)
+
+	// Resolve git context for the target path.
+	var targetBranch, targetRepoRoot string
+	if filePath != "" {
+		targetBranch = gitBranchForPath(filePath)
+		targetRepoRoot = gitRepoRootForPath(filePath)
+	}
+
+	return checks.GuardBranch(branch, repoRoot, hasStagedChanges, cfg, checks.TargetInfo{
+		FilePath: filePath,
+		Branch:   targetBranch,
+		RepoRoot: targetRepoRoot,
+		Content:  content,
+		Command:  bash.Command,
+	})
 }
 
 func runLint(input HookInput, cfg config.Config) CheckResult {
@@ -240,6 +277,22 @@ func gitRepoRoot() string {
 func gitHasStagedChanges() bool {
 	err := exec.Command("git", "diff", "--cached", "--quiet").Run()
 	return err != nil
+}
+
+func gitBranchForPath(path string) string {
+	out, err := exec.Command("git", "-C", filepath.Dir(path), "symbolic-ref", "--short", "HEAD").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func gitRepoRootForPath(path string) string {
+	out, err := exec.Command("git", "-C", filepath.Dir(path), "rev-parse", "--show-toplevel").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
 }
 
 func counterFilePath() string {
