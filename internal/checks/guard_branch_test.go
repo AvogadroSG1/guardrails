@@ -489,6 +489,13 @@ func TestGuardBranch_IndirectWrite(t *testing.T) {
 			content:  "cmd | tee /Users/test/code/myproject/out.go",
 			want:     true,
 		},
+		// Regression: redirect target parsing must not match repoPrefix later in line.
+		{
+			name:     "redirect to /tmp then read from repoRoot (safe)",
+			filePath: "/tmp/extract.sh",
+			content:  "echo hi > /tmp/out; cat /Users/test/code/myproject/file.go",
+			want:     false,
+		},
 	}
 
 	for _, tt := range tests {

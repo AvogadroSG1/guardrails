@@ -122,6 +122,44 @@ func isShellRedirect(line string, opStart, afterEnd int) bool {
 	return true
 }
 
+// extractRedirectTarget extracts the path token immediately following a shell
+// redirect operator (> or >>). Skips leading whitespace and optional quotes.
+// Returns the extracted path or empty string if no path token is found.
+func extractRedirectTarget(line string, afterRedirect int) string {
+	rest := line[afterRedirect:]
+	// Skip leading whitespace
+	i := 0
+	for i < len(rest) && (rest[i] == ' ' || rest[i] == '\t') {
+		i++
+	}
+	if i >= len(rest) {
+		return ""
+	}
+	
+	// Check for optional quotes
+	quote := byte(0)
+	if rest[i] == '"' || rest[i] == '\'' {
+		quote = rest[i]
+		i++
+	}
+	
+	// Extract the path token
+	start := i
+	if quote != 0 {
+		// Find closing quote
+		for i < len(rest) && rest[i] != quote {
+			i++
+		}
+	} else {
+		// Find end of token (whitespace or shell metacharacter)
+		for i < len(rest) && rest[i] != ' ' && rest[i] != '\t' && rest[i] != ';' && rest[i] != '|' && rest[i] != '&' {
+			i++
+		}
+	}
+	
+	return rest[start:i]
+}
+
 // checkTempOrNonGitContent scans file content for git manipulation commands.
 // Tier-1: always block commit/push/reset/merge/rebase/cherry-pick/am/stash.
 // Tier-2: block checkout/switch targeting a protected branch from cfg.
@@ -200,13 +238,16 @@ func checkContentForPathWrites(content, repoRoot string) CheckResult {
 
 		// Shell redirect: broad regex catches both spaced and no-space forms.
 		// isShellRedirect excludes >=, =>, and -> false positives.
+		// extractRedirectTarget parses the actual redirect target token to avoid
+		// false positives when repoPrefix appears elsewhere on the line.
 		for _, loc := range shellRedirectRE.FindAllStringSubmatchIndex(line, -1) {
 			opStart := loc[2]  // position of first >
 			afterEnd := loc[3] // position after > or >>
 			if !isShellRedirect(line, opStart, afterEnd) {
 				continue
 			}
-			if strings.Contains(line[afterEnd:], repoPrefix) {
+			target := extractRedirectTarget(line, afterEnd)
+			if strings.HasPrefix(target, repoPrefix) || target == repoRoot {
 				return CheckResult{
 					Block:   true,
 					Message: fmt.Sprintf("File content writes to protected repo %q: %q", repoRoot, truncate(line, 120)),
