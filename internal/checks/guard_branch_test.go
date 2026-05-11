@@ -228,6 +228,14 @@ func TestGuardBranch_TempDirBypass(t *testing.T) {
 			content:  "git switch --create develop",
 			want:     true,
 		},
+		// Regression: \b would match main-backup because '-' is a non-word char.
+		// (?:\s|$) requires whitespace or end-of-string, so this must NOT block.
+		{
+			name:     "git checkout main-backup in /tmp (not a protected branch name)",
+			filePath: "/tmp/branch.sh",
+			content:  "git checkout main-backup",
+			want:     false,
+		},
 	}
 
 	for _, tt := range tests {

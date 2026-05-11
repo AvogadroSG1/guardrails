@@ -131,7 +131,7 @@ func checkTempOrNonGitContent(content string, cfg config.Config) CheckResult {
 	// Pre-compile protected-branch checkout/switch patterns once for all lines.
 	var checkoutREs []*regexp.Regexp
 	for _, pattern := range cfg.ProtectedBranches {
-		re, err := regexp.Compile(`(?i)git\s+(checkout|switch)\s+(-[bBcCt]\s+|--(?:create|force-create|track|orphan)\s+)?` + pattern + `\b`)
+		re, err := regexp.Compile(`(?i)git\s+(checkout|switch)\s+(-[bBcCt]\s+|--(?:create|force-create|track|orphan)\s+)?` + pattern + `(?:\s|$)`)
 		if err != nil {
 			continue
 		}
